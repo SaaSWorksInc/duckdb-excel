@@ -8,6 +8,8 @@ namespace duckdb {
 
 class ClientContext;
 
+class ZipFileReader;
+
 class ZipFileWriter {
 public:
 	ZipFileWriter(ClientContext &context, const string &file_name);
@@ -25,6 +27,10 @@ public:
 
 	void EndFile();
 	void Finalize();
+
+	// Copy a single entry (file or directory) verbatim from a source archive into this one.
+	// The source must not have an entry currently open.
+	void CopyEntryFrom(ZipFileReader &source, const string &entry_name);
 
 private:
 	void *handle;
@@ -53,7 +59,15 @@ public:
 	// Returns if the current entry is done
 	bool IsDone() const;
 
+	// Walk all entries in the archive and return their names. The reader must not have an entry currently open.
+	vector<string> ListEntries();
+
+	// Returns true if the entry exists and is a directory entry (filename ends with '/').
+	bool EntryIsDirectory(const string &entry_name);
+
 private:
+	friend class ZipFileWriter;
+
 	void *handle;
 	void *stream;
 	bool is_entry_open;

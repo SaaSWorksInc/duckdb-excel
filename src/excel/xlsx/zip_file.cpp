@@ -279,6 +279,78 @@ void ZipFileWriter::Finalize() {
 	}
 }
 
+void ZipFileWriter::CopyEntryFrom(ZipFileReader &source, const string &entry_name) {
+	if (is_entry_open) {
+		throw IOException("ZipWriter: Cannot copy an entry while another is open");
+	}
+
+	if (mz_zip_reader_locate_entry(source.handle, entry_name.c_str(), 0) != MZ_OK) {
+		throw IOException("ZipWriter: Source entry '%s' not found", entry_name);
+	}
+
+	mz_zip_file *src_info = nullptr;
+	if (mz_zip_reader_entry_get_info(source.handle, &src_info) != MZ_OK || src_info == nullptr) {
+		throw IOException("ZipWriter: Failed to read source entry info for '%s'", entry_name);
+	}
+
+	const bool is_directory = mz_zip_entry_is_dir(source.handle) == MZ_OK;
+
+	mz_zip_file file_info = {};
+	file_info.filename = entry_name.c_str();
+	file_info.compression_method = is_directory ? MZ_COMPRESS_METHOD_STORE : MZ_COMPRESS_METHOD_DEFLATE;
+	file_info.zip64 = MZ_ZIP64_DISABLE;
+	file_info.modified_date = src_info->modified_date;
+	file_info.creation_date = src_info->creation_date;
+	file_info.accessed_date = src_info->accessed_date;
+	file_info.external_fa = src_info->external_fa;
+	file_info.internal_fa = src_info->internal_fa;
+
+	if (is_directory) {
+		// Directory entries have no payload
+		if (mz_zip_writer_add_buffer(handle, nullptr, 0, &file_info) != MZ_OK) {
+			throw IOException("ZipWriter: Failed to write directory entry '%s'", entry_name);
+		}
+		return;
+	}
+
+	if (mz_zip_reader_entry_open(source.handle) != MZ_OK) {
+		throw IOException("ZipWriter: Failed to open source entry '%s' for reading", entry_name);
+	}
+
+	if (mz_zip_writer_entry_open(handle, &file_info) != MZ_OK) {
+		mz_zip_reader_entry_close(source.handle);
+		throw IOException("ZipWriter: Failed to open destination entry '%s' for writing", entry_name);
+	}
+
+	constexpr int32_t COPY_BUFFER_SIZE = 8192;
+	char buffer[COPY_BUFFER_SIZE];
+	while (true) {
+		const auto bytes_read = mz_zip_reader_entry_read(source.handle, buffer, COPY_BUFFER_SIZE);
+		if (bytes_read < 0) {
+			mz_zip_writer_entry_close(handle);
+			mz_zip_reader_entry_close(source.handle);
+			throw IOException("ZipWriter: Failed to read source entry '%s'", entry_name);
+		}
+		if (bytes_read == 0) {
+			break;
+		}
+		const auto bytes_written = mz_zip_writer_entry_write(handle, buffer, bytes_read);
+		if (bytes_written < 0) {
+			mz_zip_writer_entry_close(handle);
+			mz_zip_reader_entry_close(source.handle);
+			throw IOException("ZipWriter: Failed to write entry '%s'", entry_name);
+		}
+	}
+
+	if (mz_zip_writer_entry_close(handle) != MZ_OK) {
+		mz_zip_reader_entry_close(source.handle);
+		throw IOException("ZipWriter: Failed to close destination entry '%s'", entry_name);
+	}
+	if (mz_zip_reader_entry_close(source.handle) != MZ_OK) {
+		throw IOException("ZipWriter: Failed to close source entry '%s'", entry_name);
+	}
+}
+
 //-------------------------------------------------------------------------
 // Zip File Reader
 //-------------------------------------------------------------------------
@@ -372,6 +444,36 @@ idx_t ZipFileReader::GetEntryLen() const {
 
 bool ZipFileReader::IsDone() const {
 	return entry_pos >= entry_len;
+}
+
+vector<string> ZipFileReader::ListEntries() {
+	if (is_entry_open) {
+		throw IOException("ZipReader: Cannot list entries while an entry is open");
+	}
+	vector<string> entries;
+	auto status = mz_zip_reader_goto_first_entry(handle);
+	while (status == MZ_OK) {
+		mz_zip_file *info = nullptr;
+		if (mz_zip_reader_entry_get_info(handle, &info) != MZ_OK || info == nullptr) {
+			throw IOException("ZipReader: Failed to read entry info while listing entries");
+		}
+		entries.emplace_back(info->filename);
+		status = mz_zip_reader_goto_next_entry(handle);
+	}
+	if (status != MZ_END_OF_LIST && status != MZ_OK) {
+		throw IOException("ZipReader: Failed to enumerate entries");
+	}
+	return entries;
+}
+
+bool ZipFileReader::EntryIsDirectory(const string &entry_name) {
+	if (is_entry_open) {
+		throw IOException("ZipReader: Cannot inspect entries while another is open");
+	}
+	if (mz_zip_reader_locate_entry(handle, entry_name.c_str(), 0) != MZ_OK) {
+		return false;
+	}
+	return mz_zip_entry_is_dir(handle) == MZ_OK;
 }
 
 ZipFileReader::~ZipFileReader() {
