@@ -10,9 +10,18 @@ class ClientContext;
 
 class ZipFileReader;
 
+enum class ZipOpenMode { Create, Append };
+
 class ZipFileWriter {
 public:
-	ZipFileWriter(ClientContext &context, const string &file_name);
+	// Default: truncates any existing file at file_name and writes a fresh zip.
+	ZipFileWriter(ClientContext &context, const string &file_name)
+	    : ZipFileWriter(context, file_name, ZipOpenMode::Create) {
+	}
+	// Append mode: opens an existing zip in place; new entries are written after the existing
+	// central directory. The central directory is rebuilt on close, so duplicate-name entries
+	// (e.g. a replacement xl/workbook.xml) are resolved last-wins by readers.
+	ZipFileWriter(ClientContext &context, const string &file_name, ZipOpenMode mode);
 	~ZipFileWriter();
 
 	// Delete copy

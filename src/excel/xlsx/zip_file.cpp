@@ -116,15 +116,21 @@ int32_t mz_stream_duckdb_seek(void *stream, int64_t offset, int32_t origin) {
 	auto &self = *reinterpret_cast<mz_stream_duckdb *>(stream);
 	switch (origin) {
 	case MZ_SEEK_SET:
-		self.handle->Seek(offset);
+		self.handle->Seek(static_cast<idx_t>(offset));
 		break;
-	case MZ_SEEK_CUR:
-		self.handle->Seek(self.handle->SeekPosition() + offset);
+	case MZ_SEEK_CUR: {
+		const auto pos = static_cast<int64_t>(self.handle->SeekPosition()) + offset;
+		self.handle->Seek(static_cast<idx_t>(pos < 0 ? 0 : pos));
 		break;
-	case MZ_SEEK_END:
-		// is the offset negative when seeking from the end?
-		self.handle->Seek(self.handle->SeekPosition() + offset);
+	}
+	case MZ_SEEK_END: {
+		// minizip uses end-relative seeks (typically negative offset) to find the central
+		// directory in an existing zip; required for append mode.
+		const auto file_size = static_cast<int64_t>(self.handle->GetFileSize());
+		const auto pos = file_size + offset;
+		self.handle->Seek(static_cast<idx_t>(pos < 0 ? 0 : pos));
 		break;
+	}
 	default:
 		return MZ_SEEK_ERROR;
 	}
@@ -172,7 +178,7 @@ void mz_stream_duckdb_delete(void **stream) {
 // Zip File Writer
 //-------------------------------------------------------------------------
 
-ZipFileWriter::ZipFileWriter(ClientContext &context, const string &file_name) {
+ZipFileWriter::ZipFileWriter(ClientContext &context, const string &file_name, ZipOpenMode mode) {
 	handle = mz_zip_writer_create();
 	stream = mz_stream_duckdb_create();
 	is_entry_open = false;
@@ -187,7 +193,12 @@ ZipFileWriter::ZipFileWriter(ClientContext &context, const string &file_name) {
 	mz_zip_writer_set_compress_level(handle, MZ_COMPRESS_LEVEL_NORMAL);
 	mz_zip_writer_set_compress_method(handle, MZ_COMPRESS_METHOD_DEFLATE);
 
-	if (mz_stream_open(stream, file_name.c_str(), MZ_OPEN_MODE_CREATE | MZ_OPEN_MODE_WRITE) != MZ_OK) {
+	const int32_t stream_flags = (mode == ZipOpenMode::Append)
+	                                 ? (MZ_OPEN_MODE_READ | MZ_OPEN_MODE_WRITE)
+	                                 : (MZ_OPEN_MODE_CREATE | MZ_OPEN_MODE_WRITE);
+	const uint8_t append_flag = (mode == ZipOpenMode::Append) ? 1 : 0;
+
+	if (mz_stream_open(stream, file_name.c_str(), stream_flags) != MZ_OK) {
 		if (duckdb_stream.last_error.empty()) {
 			throw IOException("Failed to open file for writing");
 		} else {
@@ -195,7 +206,7 @@ ZipFileWriter::ZipFileWriter(ClientContext &context, const string &file_name) {
 		}
 	}
 
-	if (mz_zip_writer_open(handle, stream, 0) != MZ_OK) {
+	if (mz_zip_writer_open(handle, stream, append_flag) != MZ_OK) {
 		if (duckdb_stream.last_error.empty()) {
 			throw IOException("Failed to open zip for writing");
 		} else {
@@ -386,8 +397,36 @@ ZipFileReader::ZipFileReader(ClientContext &context, const string &file_name) {
 }
 
 bool ZipFileReader::TryOpenEntry(const string &file_name) {
-	if (mz_zip_reader_locate_entry(handle, file_name.c_str(), 0) != MZ_OK) {
+	// An xlsx that's been appended to with our writer can contain multiple entries with the
+	// same name in the central directory (e.g. the original xl/workbook.xml plus a replacement
+	// emitted by the appender). The OOXML/ZIP convention is last-wins — the entry that appears
+	// LATER in the central directory is the authoritative one. Walk all entries and select the
+	// last one whose filename matches.
+	int32_t target_index = -1;
+	int32_t current = 0;
+	auto status = mz_zip_reader_goto_first_entry(handle);
+	while (status == MZ_OK) {
+		mz_zip_file *info = nullptr;
+		if (mz_zip_reader_entry_get_info(handle, &info) == MZ_OK && info != nullptr && info->filename != nullptr) {
+			if (file_name == info->filename) {
+				target_index = current;
+			}
+		}
+		current++;
+		status = mz_zip_reader_goto_next_entry(handle);
+	}
+	if (target_index < 0) {
 		return false;
+	}
+
+	// Re-walk to position at the chosen index. Bounded by entry count (small for xlsx).
+	if (mz_zip_reader_goto_first_entry(handle) != MZ_OK) {
+		return false;
+	}
+	for (int32_t i = 0; i < target_index; i++) {
+		if (mz_zip_reader_goto_next_entry(handle) != MZ_OK) {
+			return false;
+		}
 	}
 
 	if (mz_zip_reader_entry_open(handle) != MZ_OK) {

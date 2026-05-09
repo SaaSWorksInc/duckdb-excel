@@ -15,8 +15,9 @@ public:
 	                const vector<string> &sql_column_names, const vector<LogicalType> &sql_column_types);
 	void EndSheet();
 
-	explicit XLXSWriter(ClientContext &context, const string &file_name, idx_t sheet_row_limit_p)
-	    : stream(context, file_name), sheet_row_limit(sheet_row_limit_p) {
+	explicit XLXSWriter(ClientContext &context, const string &file_name, idx_t sheet_row_limit_p,
+	                    ZipOpenMode mode = ZipOpenMode::Create)
+	    : stream(context, file_name, mode), sheet_row_limit(sheet_row_limit_p) {
 	}
 
 	void WriteNumberCell(const string_t &value);

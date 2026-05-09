@@ -12,19 +12,35 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_context.hpp"
 
-#include <atomic>
-#include <chrono>
+#include <cstring>
 #include <unordered_set>
 
 namespace duckdb {
 
+// Append a new sheet (or replace one) into an existing xlsx using minizip's append-mode writer.
+//
+// Flow:
+//   1. Read just the metadata files we need from `source_path` (workbook.xml,
+//      workbook.xml.rels, [Content_Types].xml, styles.xml) — typically a few KB total.
+//      Close the source reader.
+//   2. If `source_path != dest_path` (caller is using the COPY framework's atomic temp
+//      file), OS-copy source to dest at the filesystem level. APFS / btrfs / XFS make
+//      this a copy-on-write operation; ext4/Windows do a real sequential byte copy.
+//   3. Open `dest_path` with the zip writer in APPEND mode. Existing entries stay on
+//      disk; new entries are written after the existing central directory, and a fresh
+//      central directory is written on close. Duplicate-name entries (e.g. a replacement
+//      `xl/workbook.xml`) are resolved last-wins by readers.
+//   4. Append the new sheet's worksheet XML and any updated metadata files.
+//
+// Per-append cost is O(source_file_size) for the OS copy + O(new_sheet_size) for the
+// append. Independent of the number of existing sheets in their decompressed form, since
+// no entry data is decompressed/recompressed.
 class XLSXAppender {
 public:
-	// source_path: existing xlsx to read from (must exist)
-	// dest_path:   where the new xlsx is written; caller (e.g. DuckDB COPY framework) is
-	//              responsible for renaming dest_path onto the user-visible target. If the caller
-	//              passes the same path for both, source is read fully before dest is opened, so
-	//              same-path appends would lose data — don't do that without a tmp dance outside.
+	// source_path: existing xlsx to read structural metadata from (must exist).
+	// dest_path:   where to write the resulting xlsx. If equal to source_path the append
+	//              happens in place (no atomicity); if different (COPY framework's temp),
+	//              we OS-copy source to dest first and append into dest.
 	XLSXAppender(ClientContext &context_p, const string &source_path_p, const string &dest_path_p,
 	             const string &sheet_name_p, bool replace_p, idx_t sheet_row_limit_p);
 	~XLSXAppender() = default;
@@ -66,31 +82,29 @@ public:
 		writer->WriteEmptyCell();
 	}
 
-	// End the sheet, write modified metadata, finalize the zip, atomic-rename onto the target.
+	// Close the new sheet, append updated metadata, finalize the zip.
 	void Finish();
 
 private:
 	struct ResolvedStyles {
-		idx_t date;
-		idx_t ts_no_ms;
-		idx_t time_;
-		idx_t ts_with_ms;
-		idx_t boolean;
-		// numFmts and xf rows that need to be spliced into styles.xml. Empty == no patch needed.
+		idx_t date = 1;
+		idx_t ts_no_ms = 2;
+		idx_t time_ = 3;
+		idx_t ts_with_ms = 4;
+		idx_t boolean = 5;
+		// numFmts and xf rows that need to be spliced into a replacement styles.xml.
+		// Empty == no patch needed (existing styles.xml already covers everything we use).
 		vector<string> num_fmt_inserts;
 		vector<string> xf_inserts;
-		// New count attribute values (only used when inserts are non-empty)
 		idx_t new_num_fmts_count = 0;
 		idx_t new_cell_xfs_count = 0;
-		bool num_fmts_block_existed = false;
 	};
 
 	static string ReadEntryAsString(ZipFileReader &reader, const string &entry_name);
-	static vector<char> ReadEntryAsBytes(ZipFileReader &reader, const string &entry_name);
 	static idx_t ParseRidNumber(const string &rid);
 	static string ToLowerAscii(const string &input);
 
-	ResolvedStyles ResolveStyles(const string &raw_styles_xml, const StylesAppendParser &parser);
+	ResolvedStyles ResolveStyles(const StylesAppendParser &parser);
 	string PatchStylesXml(const string &original, const ResolvedStyles &resolved);
 	string BuildContentTypesXml(const string &original);
 	string BuildWorkbookXml(const string &original);
@@ -105,68 +119,27 @@ private:
 	bool replace;
 	idx_t sheet_row_limit;
 
-	// Discovery results
+	// Discovery results — raw bytes of the metadata files, kept for the splice.
 	vector<XLSXSheetEntry> source_sheets;
 	vector<XLSXRelation> source_wb_rels;
 	string source_content_types;
 	string source_workbook_xml;
 	string source_workbook_rels_xml;
 	string source_styles_xml;
-	bool source_has_styles = false;
 
 	// Allocation for the new (or replacement) sheet
-	string new_sheet_filename; // e.g. "sheetN.xml" (no path prefix)
+	string new_sheet_filename; // e.g. "sheetN.xml" (no path prefix; BeginSheet prepends "xl/worksheets/")
 	idx_t new_sheet_id = 0;
 	idx_t new_rid_num = 0;
 	bool replaced_existing = false;
 
 	ResolvedStyles styles;
-	bool patch_styles = false;
-
-	// Set of source entries that get rewritten and must NOT be copied verbatim.
-	std::unordered_set<string> rewrite_set;
-
-	// Verbatim entries buffered from the source archive. Buffered up-front so we can
-	// close the source file before opening the destination — Windows refuses to rename
-	// over a file that still has any open handle on it (ERROR_SHARING_VIOLATION).
-	struct BufferedEntry {
-		string name;
-		vector<char> bytes;
-	};
-	vector<BufferedEntry> verbatim_entries;
+	bool styles_need_patch = false;
 
 	unique_ptr<XLXSWriter> writer;
 };
 
 //===-- Implementation --------------------------------------------------------------------===//
-
-inline vector<char> XLSXAppender::ReadEntryAsBytes(ZipFileReader &reader, const string &entry_name) {
-	if (!reader.TryOpenEntry(entry_name)) {
-		throw IOException("Required entry '%s' not found in xlsx file", entry_name);
-	}
-	const auto entry_len = reader.GetEntryLen();
-	vector<char> result;
-	result.resize(entry_len);
-	idx_t pos = 0;
-	constexpr idx_t BUFFER_SIZE = 4096;
-	char buffer[BUFFER_SIZE];
-	while (!reader.IsDone()) {
-		const auto read_size = reader.Read(buffer, BUFFER_SIZE);
-		if (read_size == 0) {
-			break;
-		}
-		if (pos + read_size > result.size()) {
-			result.resize(pos + read_size);
-		}
-		std::memcpy(result.data() + pos, buffer, read_size);
-		pos += read_size;
-	}
-	if (pos < result.size()) {
-		result.resize(pos);
-	}
-	reader.CloseEntry();
-	return result;
-}
 
 inline string XLSXAppender::ReadEntryAsString(ZipFileReader &reader, const string &entry_name) {
 	if (!reader.TryOpenEntry(entry_name)) {
@@ -183,7 +156,7 @@ inline string XLSXAppender::ReadEntryAsString(ZipFileReader &reader, const strin
 		if (read_size == 0) {
 			break;
 		}
-		if (pos + read_size > entry_len) {
+		if (pos + read_size > result.size()) {
 			result.resize(pos + read_size);
 		}
 		std::memcpy(&result[pos], buffer, read_size);
@@ -197,7 +170,6 @@ inline string XLSXAppender::ReadEntryAsString(ZipFileReader &reader, const strin
 }
 
 inline idx_t XLSXAppender::ParseRidNumber(const string &rid) {
-	// Expected pattern: "rId<digits>". Returns 0 for any non-conforming string.
 	if (rid.size() < 4 || rid[0] != 'r' || rid[1] != 'I' || rid[2] != 'd') {
 		return 0;
 	}
@@ -224,42 +196,45 @@ inline XLSXAppender::XLSXAppender(ClientContext &context_p, const string &source
     : context(context_p), source_path(source_path_p), dest_path(dest_path_p), sheet_name(sheet_name_p),
       replace(replace_p), sheet_row_limit(sheet_row_limit_p) {
 
-	// We deliberately scope the source ZipFileReader so its file handle is closed BEFORE the
-	// destination writer is opened. On Windows the COPY framework's final rename fails if any
-	// handle on the user-visible target file is still open (ERROR_SHARING_VIOLATION). All
-	// data we'll need to copy verbatim is buffered into `verbatim_entries` inside this scope.
+	// Phase 1: read structural metadata from source. Kept in a tight scope so the source
+	// file handle is released before we proceed to file-copy or append-mode open.
 	{
-	ZipFileReader source(context, source_path);
+		ZipFileReader source(context, source_path);
 
-	// 2. Read raw bytes of the metadata files we'll rewrite. Every well-formed xlsx must have these.
-	source_content_types = ReadEntryAsString(source, "[Content_Types].xml");
-	source_workbook_xml = ReadEntryAsString(source, "xl/workbook.xml");
-	source_workbook_rels_xml = ReadEntryAsString(source, "xl/_rels/workbook.xml.rels");
+		source_content_types = ReadEntryAsString(source, "[Content_Types].xml");
+		source_workbook_xml = ReadEntryAsString(source, "xl/workbook.xml");
+		source_workbook_rels_xml = ReadEntryAsString(source, "xl/_rels/workbook.xml.rels");
 
-	// styles.xml is technically optional but ubiquitous in practice. We require it for the append
-	// path because synthesizing one would also require splicing a Content_Types override for it.
-	if (!source.TryOpenEntry("xl/styles.xml")) {
-		throw IOException("Cannot append to '%s': xl/styles.xml is missing — only xlsx files with a styles.xml are supported",
-		                  source_path);
+		if (!source.TryOpenEntry("xl/styles.xml")) {
+			throw IOException("Cannot append to '%s': xl/styles.xml is missing", source_path);
+		}
+		source.CloseEntry();
+		source_styles_xml = ReadEntryAsString(source, "xl/styles.xml");
+
+		if (!source.TryOpenEntry("xl/workbook.xml")) {
+			throw IOException("xl/workbook.xml missing in source");
+		}
+		source_sheets = WorkBookAppendParser::GetSheets(source);
+		source.CloseEntry();
+
+		if (!source.TryOpenEntry("xl/_rels/workbook.xml.rels")) {
+			throw IOException("xl/_rels/workbook.xml.rels missing in source");
+		}
+		source_wb_rels = RelParser::ParseRelations(source);
+		source.CloseEntry();
+
+		StylesAppendParser styles_parser;
+		if (source.TryOpenEntry("xl/styles.xml")) {
+			styles_parser.ParseAll(source);
+			source.CloseEntry();
+		}
+		styles = ResolveStyles(styles_parser);
 	}
-	source.CloseEntry();
-	source_styles_xml = ReadEntryAsString(source, "xl/styles.xml");
-	source_has_styles = true;
+	// source ZipFileReader destroyed here — file handle released.
 
-	// 3. Parse the structural data we need
-	if (!source.TryOpenEntry("xl/workbook.xml")) {
-		throw IOException("xl/workbook.xml missing in source");
-	}
-	source_sheets = WorkBookAppendParser::GetSheets(source);
-	source.CloseEntry();
+	styles_need_patch = !styles.num_fmt_inserts.empty() || !styles.xf_inserts.empty();
 
-	if (!source.TryOpenEntry("xl/_rels/workbook.xml.rels")) {
-		throw IOException("xl/_rels/workbook.xml.rels missing in source");
-	}
-	source_wb_rels = RelParser::ParseRelations(source);
-	source.CloseEntry();
-
-	// 4. Validate sheet name and decide what to write
+	// Phase 2: validate sheet name and allocate the new sheet's identifiers / filename.
 	const auto target_lower = ToLowerAscii(sheet_name);
 	idx_t collision_index = source_sheets.size();
 	for (idx_t i = 0; i < source_sheets.size(); i++) {
@@ -274,13 +249,14 @@ inline XLSXAppender::XLSXAppender(ClientContext &context_p, const string &source
 			throw InvalidInputException("Sheet '%s' not found in '%s' (REPLACE)", sheet_name, source_path);
 		}
 		replaced_existing = true;
-		// REPLACE: keep the existing sheet's rId, sheetId, and filename
+		// Reuse the existing sheet's rId, sheetId, and filename. The new worksheet entry
+		// gets the same name as the old one — last-wins semantics make our content active
+		// and external references (charts, defined names, pivots) keep resolving.
 		const auto &existing = source_sheets[collision_index];
 		new_rid_num = ParseRidNumber(existing.rid);
 		new_sheet_id = existing.sheet_id.empty() ? (collision_index + 1)
 		                                         : static_cast<idx_t>(strtoul(existing.sheet_id.c_str(), nullptr, 10));
 
-		// Resolve the worksheet target path via workbook.xml.rels
 		string target_rel;
 		for (auto &rel : source_wb_rels) {
 			if (rel.id == existing.rid) {
@@ -291,31 +267,19 @@ inline XLSXAppender::XLSXAppender(ClientContext &context_p, const string &source
 		if (target_rel.empty()) {
 			throw IOException("Could not resolve relationship '%s' for sheet '%s'", existing.rid, sheet_name);
 		}
-		// Normalize to a path inside the zip (relationships in xl/_rels are relative to xl/)
-		string full_target;
-		if (StringUtil::StartsWith(target_rel, "/")) {
-			full_target = target_rel.substr(1);
-		} else {
-			full_target = "xl/" + target_rel;
-		}
-		// new_sheet_filename is just the leaf name; BeginSheet prepends "xl/worksheets/"
+		string full_target = StringUtil::StartsWith(target_rel, "/") ? target_rel.substr(1) : ("xl/" + target_rel);
 		auto last_slash = full_target.find_last_of('/');
 		new_sheet_filename = (last_slash == string::npos) ? full_target : full_target.substr(last_slash + 1);
 
-		// Verify this lives under xl/worksheets/ — if it doesn't, the path scheme differs and we'd
-		// emit the new sheet at a different path than the old. Reject rather than corrupt the file.
 		if (full_target != "xl/worksheets/" + new_sheet_filename) {
 			throw IOException("REPLACE not supported: sheet '%s' is stored at '%s', expected xl/worksheets/<name>",
 			                  sheet_name, full_target);
 		}
-		// REPLACE: skip the old sheet entry; everything else stays verbatim.
-		rewrite_set.insert(full_target);
 	} else {
 		if (collision_index != source_sheets.size()) {
 			throw InvalidInputException("Sheet '%s' already exists in '%s' (use REPLACE to overwrite)", sheet_name,
 			                            source_path);
 		}
-		// APPEND: allocate fresh ids and a non-colliding filename
 		idx_t max_sheet_id = 0;
 		for (auto &sheet : source_sheets) {
 			if (!sheet.sheet_id.empty()) {
@@ -331,81 +295,69 @@ inline XLSXAppender::XLSXAppender(ClientContext &context_p, const string &source
 		}
 		new_rid_num = max_rid + 1;
 
-		// Find a sheetN.xml that doesn't collide with anything in the source archive.
-		const auto entry_names = source.ListEntries();
-		std::unordered_set<string> entry_set(entry_names.begin(), entry_names.end());
+		// Allocate a non-colliding sheet filename. We don't have the entry list here (we
+		// closed the source reader to release the handle), but we can derive it from the
+		// existing relationships: every worksheet relationship points at a `worksheets/sheetN.xml`.
+		std::unordered_set<idx_t> used_indices;
+		for (auto &rel : source_wb_rels) {
+			if (!StringUtil::EndsWith(rel.type, "/worksheet")) {
+				continue;
+			}
+			// Extract N from "worksheets/sheetN.xml" (or "/xl/worksheets/sheetN.xml").
+			auto target = rel.target;
+			auto last_slash = target.find_last_of('/');
+			auto leaf = (last_slash == string::npos) ? target : target.substr(last_slash + 1);
+			if (StringUtil::StartsWith(leaf, "sheet") && StringUtil::EndsWith(leaf, ".xml")) {
+				auto digits = leaf.substr(5, leaf.size() - 5 - 4);
+				bool all_digits = !digits.empty();
+				for (auto c : digits) {
+					if (c < '0' || c > '9') {
+						all_digits = false;
+						break;
+					}
+				}
+				if (all_digits) {
+					used_indices.insert(static_cast<idx_t>(std::strtoul(digits.c_str(), nullptr, 10)));
+				}
+			}
+		}
 		for (idx_t i = 1;; i++) {
-			const auto candidate = "sheet" + std::to_string(i) + ".xml";
-			const auto candidate_path = "xl/worksheets/" + candidate;
-			if (entry_set.find(candidate_path) == entry_set.end()) {
-				new_sheet_filename = candidate;
+			if (used_indices.find(i) == used_indices.end()) {
+				new_sheet_filename = "sheet" + std::to_string(i) + ".xml";
 				break;
 			}
 		}
-		// APPEND rewrites the workbook metadata too
-		rewrite_set.insert("[Content_Types].xml");
-		rewrite_set.insert("xl/workbook.xml");
-		rewrite_set.insert("xl/_rels/workbook.xml.rels");
 	}
 
-	// 5. Resolve styles — find existing matching numFmts/cellXfs or queue up patches.
-	if (source_has_styles) {
-		StylesAppendParser styles_parser;
-		if (source.TryOpenEntry("xl/styles.xml")) {
-			styles_parser.ParseAll(source);
-			source.CloseEntry();
+	// Phase 3: get the destination file into the right state for in-place append.
+	// If the COPY framework gave us a separate temp path, byte-copy the source onto it
+	// using DuckDB's filesystem (sequential read+write — fast on any modern storage).
+	auto &fs = FileSystem::GetFileSystem(context);
+	if (source_path != dest_path) {
+		if (fs.FileExists(dest_path)) {
+			fs.RemoveFile(dest_path);
 		}
-		styles = ResolveStyles(source_styles_xml, styles_parser);
-	} else {
-		// No styles.xml in source — synthesize one with our defaults (1..5).
-		styles.date = 1;
-		styles.ts_no_ms = 2;
-		styles.time_ = 3;
-		styles.ts_with_ms = 4;
-		styles.boolean = 5;
-		// Will need to write a fresh styles.xml; reuse XLXSWriter's WriteStyles equivalent below.
-		// For simplicity we just ship the same default styles.xml the fresh-write path uses.
-	}
-	patch_styles = !styles.num_fmt_inserts.empty() || !styles.xf_inserts.empty() || !source_has_styles;
-	if (patch_styles) {
-		rewrite_set.insert("xl/styles.xml");
+		auto src_handle =
+		    fs.OpenFile(source_path, FileFlags::FILE_FLAGS_READ);
+		auto dst_handle = fs.OpenFile(dest_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE);
+		constexpr idx_t COPY_BUF_SIZE = 64 * 1024;
+		vector<char> copy_buf(COPY_BUF_SIZE);
+		while (true) {
+			const auto n = src_handle->Read(copy_buf.data(), COPY_BUF_SIZE);
+			if (n <= 0) {
+				break;
+			}
+			dst_handle->Write(copy_buf.data(), n);
+		}
+		// Explicitly close so handles release before we open dest_path with the writer.
+		dst_handle->Close();
+		src_handle->Close();
 	}
 
-	// 6. Buffer every entry that will be copied verbatim. Reading is fast and the data is
-	// small (xlsx files are bounded; the cost is dwarfed by the cell-write loop).
-	const auto entry_names = source.ListEntries();
-	verbatim_entries.reserve(entry_names.size());
-	for (auto &entry : entry_names) {
-		if (rewrite_set.find(entry) != rewrite_set.end()) {
-			continue;
-		}
-		// Skip directory entries (filename ends in '/'); the writer never needs them and
-		// they confuse the BeginFile/Write/EndFile API.
-		if (!entry.empty() && entry.back() == '/') {
-			continue;
-		}
-		BufferedEntry buf;
-		buf.name = entry;
-		buf.bytes = ReadEntryAsBytes(source, entry);
-		verbatim_entries.push_back(std::move(buf));
-	}
-	} // source destroyed here — file handle on source_path is released
-
-	// 7. Now open the writer on the destination path and emit the buffered entries.
-	// At this point no handle on source_path remains open, so the COPY framework's final
-	// rename of dest_path onto source_path will succeed even on Windows.
-	writer = make_uniq<XLXSWriter>(context, dest_path, sheet_row_limit);
+	// Phase 4: open the writer in append mode on dest_path. minizip reads the existing
+	// central directory and positions to write new entries after it.
+	writer = make_uniq<XLXSWriter>(context, dest_path, sheet_row_limit, ZipOpenMode::Append);
 	writer->SetStyleIndices(styles.date, styles.ts_no_ms, styles.time_, styles.ts_with_ms, styles.boolean);
-
-	for (auto &entry : verbatim_entries) {
-		auto &out = writer->GetStream();
-		out.BeginFile(entry.name);
-		if (!entry.bytes.empty()) {
-			out.Write(entry.bytes.data(), entry.bytes.size());
-		}
-		out.EndFile();
-	}
-	verbatim_entries.clear();  // free memory; we no longer need the buffers
 }
 
 inline void XLSXAppender::BeginSheet(const vector<string> &sql_column_names,
@@ -413,34 +365,25 @@ inline void XLSXAppender::BeginSheet(const vector<string> &sql_column_names,
 	writer->BeginSheet(sheet_name, new_sheet_filename, sql_column_names, sql_column_types);
 }
 
-inline XLSXAppender::ResolvedStyles XLSXAppender::ResolveStyles(const string &raw_styles_xml,
-                                                                const StylesAppendParser &parser) {
-	(void)raw_styles_xml; // unused; kept for future use
+inline XLSXAppender::ResolvedStyles XLSXAppender::ResolveStyles(const StylesAppendParser &parser) {
 	ResolvedStyles result;
 
-	// The 5 number formats this writer needs. `format_code` is the *unescaped* form (what expat
-	// hands us when parsing styles.xml — entities like &quot; are already decoded). Comparison
-	// against parsed entries uses this form. When we splice a fresh <numFmt> back into styles.xml
-	// we re-escape via XML entities.
+	// The 5 number formats this writer needs. format_code is the *unescaped* form (what
+	// expat hands us when parsing styles.xml — entities like &quot; are already decoded).
+	// format_code_xml is the XML-escaped form used when writing back into styles.xml.
 	struct Needed {
-		const char *format_code;       // unescaped, for parser-side comparison
-		const char *format_code_xml;   // XML-escaped, for writing back into styles.xml
-		idx_t default_id;              // unused but kept for documentation
+		const char *format_code;
+		const char *format_code_xml;
 		idx_t *out_index;
 	};
 	Needed needed[] = {
-	    {"dd/mm/yy",                 "dd/mm/yy",                                                       165, &result.date},
-	    {"dd/mm/yyyy\\ hh:mm:ss",    "dd/mm/yyyy\\ hh:mm:ss",                                          166, &result.ts_no_ms},
-	    {"hh:mm:ss",                 "hh:mm:ss",                                                       167, &result.time_},
-	    {"dd/mm/yyyy\\ hh:mm:ss.000","dd/mm/yyyy\\ hh:mm:ss.000",                                      168, &result.ts_with_ms},
-	    {"\"TRUE\";\"TRUE\";\"FALSE\"", "&quot;TRUE&quot;;&quot;TRUE&quot;;&quot;FALSE&quot;",         169, &result.boolean},
+	    {"dd/mm/yy",                     "dd/mm/yy",                                                       &result.date},
+	    {"dd/mm/yyyy\\ hh:mm:ss",        "dd/mm/yyyy\\ hh:mm:ss",                                          &result.ts_no_ms},
+	    {"hh:mm:ss",                     "hh:mm:ss",                                                       &result.time_},
+	    {"dd/mm/yyyy\\ hh:mm:ss.000",    "dd/mm/yyyy\\ hh:mm:ss.000",                                      &result.ts_with_ms},
+	    {"\"TRUE\";\"TRUE\";\"FALSE\"",  "&quot;TRUE&quot;;&quot;TRUE&quot;;&quot;FALSE&quot;",            &result.boolean},
 	};
 
-	const auto initial_num_fmts = parser.num_fmts.size();
-	const auto initial_cell_xfs = parser.cell_xfs.size();
-	result.num_fmts_block_existed = initial_num_fmts > 0;
-
-	// Track running additions
 	vector<XLSXNumFmtEntry> effective_num_fmts = parser.num_fmts;
 	vector<XLSXCellXfEntry> effective_cell_xfs = parser.cell_xfs;
 
@@ -452,7 +395,6 @@ inline XLSXAppender::ResolvedStyles XLSXAppender::ResolveStyles(const string &ra
 	}
 
 	for (auto &need : needed) {
-		// Resolve numFmtId for this format code (find existing or queue insertion)
 		idx_t resolved_num_fmt_id = 0;
 		bool found_num_fmt = false;
 		for (auto &nfmt : effective_num_fmts) {
@@ -464,16 +406,11 @@ inline XLSXAppender::ResolvedStyles XLSXAppender::ResolveStyles(const string &ra
 		}
 		if (!found_num_fmt) {
 			resolved_num_fmt_id = next_custom_id++;
-			XLSXNumFmtEntry new_entry;
-			new_entry.num_fmt_id = resolved_num_fmt_id;
-			new_entry.format_code = need.format_code;
-			effective_num_fmts.push_back(new_entry);
-			const auto element = StringUtil::Format(R"(<numFmt formatCode="%s" numFmtId="%d"/>)",
-			                                        need.format_code_xml, resolved_num_fmt_id);
-			result.num_fmt_inserts.push_back(element);
+			effective_num_fmts.push_back({resolved_num_fmt_id, need.format_code});
+			result.num_fmt_inserts.push_back(StringUtil::Format(
+			    R"(<numFmt formatCode="%s" numFmtId="%d"/>)", need.format_code_xml, resolved_num_fmt_id));
 		}
 
-		// Resolve cellXfs index for this numFmtId (find existing or queue insertion)
 		idx_t resolved_xf_idx = 0;
 		bool found_xf = false;
 		for (idx_t i = 0; i < effective_cell_xfs.size(); i++) {
@@ -485,26 +422,21 @@ inline XLSXAppender::ResolvedStyles XLSXAppender::ResolveStyles(const string &ra
 		}
 		if (!found_xf) {
 			resolved_xf_idx = effective_cell_xfs.size();
-			XLSXCellXfEntry new_xf;
-			new_xf.num_fmt_id = resolved_num_fmt_id;
-			effective_cell_xfs.push_back(new_xf);
-			const auto element = StringUtil::Format(R"(<xf numFmtId="%d" xfId="0"/>)", resolved_num_fmt_id);
-			result.xf_inserts.push_back(element);
+			effective_cell_xfs.push_back({resolved_num_fmt_id});
+			result.xf_inserts.push_back(
+			    StringUtil::Format(R"(<xf numFmtId="%d" xfId="0"/>)", resolved_num_fmt_id));
 		}
 		*need.out_index = resolved_xf_idx;
 	}
 
 	result.new_num_fmts_count = effective_num_fmts.size();
 	result.new_cell_xfs_count = effective_cell_xfs.size();
-	(void)initial_num_fmts;
-	(void)initial_cell_xfs;
 	return result;
 }
 
 inline string XLSXAppender::PatchStylesXml(const string &original, const ResolvedStyles &resolved) {
 	string patched = original;
 
-	// Splice xf rows before </cellXfs> and update count attribute
 	if (!resolved.xf_inserts.empty()) {
 		const auto close_pos = patched.rfind("</cellXfs>");
 		if (close_pos == string::npos) {
@@ -516,7 +448,6 @@ inline string XLSXAppender::PatchStylesXml(const string &original, const Resolve
 		}
 		patched.insert(close_pos, inserts);
 
-		// Update the count attribute on the <cellXfs ...> opening tag
 		const auto open_pos = patched.find("<cellXfs");
 		if (open_pos != string::npos) {
 			const auto tag_end = patched.find('>', open_pos);
@@ -534,7 +465,6 @@ inline string XLSXAppender::PatchStylesXml(const string &original, const Resolve
 		}
 	}
 
-	// Splice numFmt rows before </numFmts> and update count attribute (or create the block)
 	if (!resolved.num_fmt_inserts.empty()) {
 		string inserts;
 		for (auto &nfmt : resolved.num_fmt_inserts) {
@@ -543,7 +473,6 @@ inline string XLSXAppender::PatchStylesXml(const string &original, const Resolve
 		const auto close_pos = patched.rfind("</numFmts>");
 		if (close_pos != string::npos) {
 			patched.insert(close_pos, inserts);
-			// Update count
 			const auto open_pos = patched.find("<numFmts");
 			if (open_pos != string::npos) {
 				const auto tag_end = patched.find('>', open_pos);
@@ -560,7 +489,6 @@ inline string XLSXAppender::PatchStylesXml(const string &original, const Resolve
 				}
 			}
 		} else {
-			// No <numFmts> block exists — create one right after the styleSheet opening tag
 			const auto sheet_open = patched.find("<styleSheet");
 			if (sheet_open == string::npos) {
 				throw IOException("Cannot patch styles.xml: missing <styleSheet>");
@@ -579,7 +507,6 @@ inline string XLSXAppender::PatchStylesXml(const string &original, const Resolve
 }
 
 inline string XLSXAppender::BuildContentTypesXml(const string &original) {
-	// Splice a single <Override> for the new sheet just before </Types>
 	const auto close_pos = original.rfind("</Types>");
 	if (close_pos == string::npos) {
 		throw IOException("Cannot patch [Content_Types].xml: missing </Types>");
@@ -621,59 +548,27 @@ inline void XLSXAppender::EmitMetadata() {
 	auto &out = writer->GetStream();
 
 	if (!replaced_existing) {
-		// APPEND: rewrite Content_Types, workbook.xml, workbook.xml.rels
-		const auto content_types = BuildContentTypesXml(source_content_types);
+		// APPEND: write replacement workbook.xml, workbook.xml.rels, [Content_Types].xml.
+		// These appear later in the central directory than the originals, so last-wins
+		// readers (Excel, openpyxl, our own read_xlsx) pick up our updated versions.
 		out.BeginFile("[Content_Types].xml");
-		out.Write(content_types);
+		out.Write(BuildContentTypesXml(source_content_types));
 		out.EndFile();
 
-		const auto workbook = BuildWorkbookXml(source_workbook_xml);
 		out.BeginFile("xl/workbook.xml");
-		out.Write(workbook);
+		out.Write(BuildWorkbookXml(source_workbook_xml));
 		out.EndFile();
 
-		const auto workbook_rels = BuildWorkbookRelsXml(source_workbook_rels_xml);
 		out.BeginFile("xl/_rels/workbook.xml.rels");
-		out.Write(workbook_rels);
+		out.Write(BuildWorkbookRelsXml(source_workbook_rels_xml));
 		out.EndFile();
 	}
-	// REPLACE doesn't touch [Content_Types].xml / workbook.xml / workbook.xml.rels;
-	// the verbatim copy already preserved them.
+	// REPLACE keeps workbook.xml / workbook.xml.rels / [Content_Types].xml unchanged —
+	// the new sheet entry shares the existing sheet's filename, so last-wins handles it.
 
-	if (patch_styles) {
-		string styles_xml;
-		if (source_has_styles) {
-			styles_xml = PatchStylesXml(source_styles_xml, styles);
-		} else {
-			// Fresh styles.xml using our defaults — inline the same content as XLXSWriter::WriteStyles.
-			styles_xml =
-			    R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>)"
-			    R"(<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">)"
-			    R"(<numFmts count="6">)"
-			    R"(<numFmt formatCode="General" numFmtId="164"/>)"
-			    R"(<numFmt formatCode="dd/mm/yy" numFmtId="165"/>)"
-			    R"(<numFmt formatCode="dd/mm/yyyy\ hh:mm:ss" numFmtId="166"/>)"
-			    R"(<numFmt formatCode="hh:mm:ss" numFmtId="167"/>)"
-			    R"(<numFmt formatCode="dd/mm/yyyy\ hh:mm:ss.000" numFmtId="168"/>)"
-			    R"(<numFmt formatCode="&quot;TRUE&quot;;&quot;TRUE&quot;;&quot;FALSE&quot;" numFmtId="169"/>)"
-			    R"(</numFmts>)"
-			    R"(<fonts count="1"><font><name val="Arial"/><family val="2"/><sz val="12"/></font></fonts>)"
-			    R"(<fills count="1"><fill><patternFill patternType="none"/></fill></fills>)"
-			    R"(<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>)"
-			    R"(<cellStyleXfs count="1"><xf numFmtId="164"></xf></cellStyleXfs>)"
-			    R"(<cellXfs count="6">)"
-			    R"(<xf numFmtId="164" xfId="0"/>)"
-			    R"(<xf numFmtId="165" xfId="0"/>)"
-			    R"(<xf numFmtId="166" xfId="0"/>)"
-			    R"(<xf numFmtId="167" xfId="0"/>)"
-			    R"(<xf numFmtId="168" xfId="0"/>)"
-			    R"(<xf numFmtId="169" xfId="0"/>)"
-			    R"(</cellXfs>)"
-			    R"(<cellStyles count="1"><cellStyle builtinId="0" customBuiltin="false" name="Normal" xfId="0"/></cellStyles>)"
-			    R"(</styleSheet>)";
-		}
+	if (styles_need_patch) {
 		out.BeginFile("xl/styles.xml");
-		out.Write(styles_xml);
+		out.Write(PatchStylesXml(source_styles_xml, styles));
 		out.EndFile();
 	}
 }
@@ -682,8 +577,8 @@ inline void XLSXAppender::Finish() {
 	writer->EndSheet();
 	EmitMetadata();
 	writer->GetStream().Finalize();
-	// dest_path is now a complete xlsx; the caller (DuckDB COPY framework) will rename it onto the
-	// user-visible target path.
+	// dest_path is now a complete xlsx; the COPY framework will rename it onto the user's
+	// target path (when USE_TMP_FILE is true). For USE_TMP_FILE false, dest_path == target.
 }
 
 } // namespace duckdb
