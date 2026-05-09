@@ -24,7 +24,7 @@ jobs:
     name: Build extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
-      duckdb_version: v1.5.0
+      duckdb_version: v1.5.2
       ci_tools_version: main
       extension_name: excel
 
@@ -46,13 +46,13 @@ jobs:
       - name: Download all extension artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: excel-v1.5.0-extension-*
+          pattern: excel-v1.5.2-extension-*
           path: artifacts
 
       - name: Organize artifacts into DuckDB extension repo layout
         run: |
           set -euxo pipefail
-          DUCKDB_VERSION=v1.5.0
+          DUCKDB_VERSION=v1.5.2
           mkdir -p public/${DUCKDB_VERSION}
           for dir in artifacts/excel-${DUCKDB_VERSION}-extension-*; do
             arch="${dir##*/excel-${DUCKDB_VERSION}-extension-}"
