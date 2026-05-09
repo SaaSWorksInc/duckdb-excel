@@ -21,10 +21,14 @@ concurrency:
 
 jobs:
   duckdb-stable-build:
-    name: Build extension binaries
+    name: Build extension binaries (DuckDB ${{ matrix.duckdb_version }})
+    strategy:
+      fail-fast: false
+      matrix:
+        duckdb_version: [v1.4.3, v1.5.2]
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
-      duckdb_version: v1.5.2
+      duckdb_version: ${{ matrix.duckdb_version }}
       ci_tools_version: main
       extension_name: excel
 
@@ -46,24 +50,28 @@ jobs:
       - name: Download all extension artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: excel-v1.5.2-extension-*
+          # Matches every `excel-<duckdb_version>-extension-<arch>` artifact
+          # produced by the build matrix, across all DuckDB versions.
+          pattern: excel-v*-extension-*
           path: artifacts
 
       - name: Organize artifacts into DuckDB extension repo layout
         run: |
           set -euxo pipefail
-          DUCKDB_VERSION=v1.5.2
-          mkdir -p public/${DUCKDB_VERSION}
-          for dir in artifacts/excel-${DUCKDB_VERSION}-extension-*; do
-            arch="${dir##*/excel-${DUCKDB_VERSION}-extension-}"
+          mkdir -p public
+          for dir in artifacts/excel-v*-extension-*; do
+            base="${dir##*/}"                          # excel-v1.4.3-extension-osx_arm64
+            rest="${base#excel-}"                      # v1.4.3-extension-osx_arm64
+            duckdb_version="${rest%%-extension-*}"     # v1.4.3
+            arch="${rest##*-extension-}"               # osx_arm64
             ext_file=$(find "$dir" -name 'excel.duckdb_extension' | head -1)
             if [ -z "$ext_file" ]; then
               echo "::warning::no excel.duckdb_extension found in $dir"
               continue
             fi
-            mkdir -p "public/${DUCKDB_VERSION}/${arch}"
-            gzip -nc "$ext_file" > "public/${DUCKDB_VERSION}/${arch}/excel.duckdb_extension.gz"
-            echo "deployed: ${DUCKDB_VERSION}/${arch}/excel.duckdb_extension.gz"
+            mkdir -p "public/${duckdb_version}/${arch}"
+            gzip -nc "$ext_file" > "public/${duckdb_version}/${arch}/excel.duckdb_extension.gz"
+            echo "deployed: ${duckdb_version}/${arch}/excel.duckdb_extension.gz"
           done
           PAGES_URL="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
           {
