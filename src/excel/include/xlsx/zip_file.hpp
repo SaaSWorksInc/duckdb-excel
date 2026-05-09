@@ -10,18 +10,9 @@ class ClientContext;
 
 class ZipFileReader;
 
-enum class ZipOpenMode { Create, Append };
-
 class ZipFileWriter {
 public:
-	// Default: truncates any existing file at file_name and writes a fresh zip.
-	ZipFileWriter(ClientContext &context, const string &file_name)
-	    : ZipFileWriter(context, file_name, ZipOpenMode::Create) {
-	}
-	// Append mode: opens an existing zip in place; new entries are written after the existing
-	// central directory. The central directory is rebuilt on close, so duplicate-name entries
-	// (e.g. a replacement xl/workbook.xml) are resolved last-wins by readers.
-	ZipFileWriter(ClientContext &context, const string &file_name, ZipOpenMode mode);
+	ZipFileWriter(ClientContext &context, const string &file_name);
 	~ZipFileWriter();
 
 	// Delete copy
@@ -37,9 +28,10 @@ public:
 	void EndFile();
 	void Finalize();
 
-	// Copy a single entry (file or directory) verbatim from a source archive into this one.
-	// The source must not have an entry currently open.
-	void CopyEntryFrom(ZipFileReader &source, const string &entry_name);
+	// Copy the source reader's CURRENTLY-POSITIONED entry verbatim into this writer.
+	// Uses minizip's raw-copy primitive — no decompression or recompression. Caller must
+	// position the reader (e.g. via GotoFirstEntry / GotoNextEntry) before calling.
+	void CopyCurrentEntryFrom(ZipFileReader &source);
 
 private:
 	void *handle;
@@ -73,6 +65,15 @@ public:
 
 	// Returns true if the entry exists and is a directory entry (filename ends with '/').
 	bool EntryIsDirectory(const string &entry_name);
+
+	// Position the cursor for sequential entry walking. Returns false when no more entries
+	// (or on error). After GotoFirstEntry / GotoNextEntry returns true, the reader is positioned
+	// on an entry and CurrentEntryName / CurrentEntryIsDirectory / ZipFileWriter::CopyCurrentEntryFrom
+	// can be used.
+	bool GotoFirstEntry();
+	bool GotoNextEntry();
+	string CurrentEntryName();
+	bool CurrentEntryIsDirectory();
 
 private:
 	friend class ZipFileWriter;

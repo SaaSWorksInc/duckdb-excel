@@ -12,35 +12,38 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_context.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <unordered_set>
 
 namespace duckdb {
 
-// Append a new sheet (or replace one) into an existing xlsx using minizip's append-mode writer.
+// Append a new sheet (or replace one) into an existing xlsx by rebuilding the zip with
+// fast raw-copy of unchanged entries (no decompression / recompression) plus the new
+// sheet and updated metadata files.
 //
 // Flow:
-//   1. Read just the metadata files we need from `source_path` (workbook.xml,
-//      workbook.xml.rels, [Content_Types].xml, styles.xml) — typically a few KB total.
-//      Close the source reader.
-//   2. If `source_path != dest_path` (caller is using the COPY framework's atomic temp
-//      file), OS-copy source to dest at the filesystem level. APFS / btrfs / XFS make
-//      this a copy-on-write operation; ext4/Windows do a real sequential byte copy.
-//   3. Open `dest_path` with the zip writer in APPEND mode. Existing entries stay on
-//      disk; new entries are written after the existing central directory, and a fresh
-//      central directory is written on close. Duplicate-name entries (e.g. a replacement
-//      `xl/workbook.xml`) are resolved last-wins by readers.
-//   4. Append the new sheet's worksheet XML and any updated metadata files.
+//   1. Open the source xlsx and read just the metadata files we need (workbook.xml,
+//      workbook.xml.rels, [Content_Types].xml, styles.xml) — typically a few KB.
+//   2. Decide which source entries we'll replace (the metadata files + the target sheet
+//      for REPLACE mode). Build a "skip set".
+//   3. Open the destination zip writer in CREATE mode (writes a fresh zip).
+//   4. Walk source entries; for each one not in the skip set (and the canonical / last
+//      occurrence if there are duplicates from a previously appended file), call
+//      `mz_zip_writer_copy_from_reader` — pure raw-byte stream copy, no decompression.
+//   5. Write the new sheet's XML and the updated metadata files into the destination.
 //
-// Per-append cost is O(source_file_size) for the OS copy + O(new_sheet_size) for the
-// append. Independent of the number of existing sheets in their decompressed form, since
-// no entry data is decompressed/recompressed.
+// Per-append cost: O(compressed_source_bytes) for the raw stream-copy + O(new_sheet_size)
+// for the new sheet. Independent of how many cells the existing sheets have, because no
+// existing sheet is ever decompressed.
 class XLSXAppender {
 public:
-	// source_path: existing xlsx to read structural metadata from (must exist).
-	// dest_path:   where to write the resulting xlsx. If equal to source_path the append
-	//              happens in place (no atomicity); if different (COPY framework's temp),
-	//              we OS-copy source to dest first and append into dest.
+	// source_path: existing xlsx to read entries from (must exist). All entries except
+	//              the ones we explicitly replace are stream-copied verbatim from here.
+	// dest_path:   where to write the resulting xlsx (a fresh zip). Must NOT equal
+	//              source_path — we open dest in CREATE mode (truncate). DuckDB's COPY
+	//              framework satisfies this by handing us its own temp file path.
 	XLSXAppender(ClientContext &context_p, const string &source_path_p, const string &dest_path_p,
 	             const string &sheet_name_p, bool replace_p, idx_t sheet_row_limit_p);
 	~XLSXAppender() = default;
@@ -136,6 +139,16 @@ private:
 	ResolvedStyles styles;
 	bool styles_need_patch = false;
 
+	// Source entries we will NOT verbatim-copy because we'll write a fresh version.
+	std::unordered_set<string> rewrite_set;
+
+	// When source_path == dest_path (e.g. DuckDB's COPY framework set USE_TMP_FILE=false
+	// because its FileExists check on a path with `~` returned false), we can't write
+	// directly to dest_path without losing the source we still need to read. In that case
+	// we write to our own sibling temp and rename onto dest_path in Finish.
+	string actual_write_path;
+	bool needs_self_rename = false;
+
 	unique_ptr<XLXSWriter> writer;
 };
 
@@ -195,6 +208,18 @@ inline XLSXAppender::XLSXAppender(ClientContext &context_p, const string &source
                                   const string &sheet_name_p, bool replace_p, idx_t sheet_row_limit_p)
     : context(context_p), source_path(source_path_p), dest_path(dest_path_p), sheet_name(sheet_name_p),
       replace(replace_p), sheet_row_limit(sheet_row_limit_p) {
+
+	if (source_path == dest_path) {
+		// Pick a unique sibling tmp path; rename ourselves in Finish.
+		static std::atomic<uint64_t> tmp_counter {0};
+		const auto now_ns =
+		    static_cast<uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+		const auto seq = tmp_counter.fetch_add(1);
+		actual_write_path = source_path + ".xlsxapp.tmp." + std::to_string(now_ns) + "." + std::to_string(seq);
+		needs_self_rename = true;
+	} else {
+		actual_write_path = dest_path;
+	}
 
 	// Phase 1: read structural metadata from source. Kept in a tight scope so the source
 	// file handle is released before we proceed to file-copy or append-mode open.
@@ -275,6 +300,9 @@ inline XLSXAppender::XLSXAppender(ClientContext &context_p, const string &source
 			throw IOException("REPLACE not supported: sheet '%s' is stored at '%s', expected xl/worksheets/<name>",
 			                  sheet_name, full_target);
 		}
+		// REPLACE: skip the existing sheet's worksheet entry — we'll rewrite it.
+		// All other entries (including workbook.xml / rels / content_types) are kept.
+		rewrite_set.insert(full_target);
 	} else {
 		if (collision_index != source_sheets.size()) {
 			throw InvalidInputException("Sheet '%s' already exists in '%s' (use REPLACE to overwrite)", sheet_name,
@@ -327,37 +355,52 @@ inline XLSXAppender::XLSXAppender(ClientContext &context_p, const string &source
 				break;
 			}
 		}
+		// APPEND rewrites the workbook metadata so the new sheet is referenced
+		rewrite_set.insert("[Content_Types].xml");
+		rewrite_set.insert("xl/workbook.xml");
+		rewrite_set.insert("xl/_rels/workbook.xml.rels");
+	}
+	if (styles_need_patch) {
+		rewrite_set.insert("xl/styles.xml");
 	}
 
-	// Phase 3: get the destination file into the right state for in-place append.
-	// If the COPY framework gave us a separate temp path, byte-copy the source onto it
-	// using DuckDB's filesystem (sequential read+write — fast on any modern storage).
+	// Phase 3: open dest as a fresh zip and stream-copy the entries we want to keep.
+	// `mz_zip_writer_copy_from_reader` copies raw compressed bytes — no decompression
+	// or recompression. Cost is O(compressed_source_bytes) of pure I/O.
 	auto &fs = FileSystem::GetFileSystem(context);
-	if (source_path != dest_path) {
-		if (fs.FileExists(dest_path)) {
-			fs.RemoveFile(dest_path);
-		}
-		auto src_handle =
-		    fs.OpenFile(source_path, FileFlags::FILE_FLAGS_READ);
-		auto dst_handle = fs.OpenFile(dest_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE);
-		constexpr idx_t COPY_BUF_SIZE = 64 * 1024;
-		vector<char> copy_buf(COPY_BUF_SIZE);
-		while (true) {
-			const auto n = src_handle->Read(copy_buf.data(), COPY_BUF_SIZE);
-			if (n <= 0) {
-				break;
-			}
-			dst_handle->Write(copy_buf.data(), n);
-		}
-		// Explicitly close so handles release before we open dest_path with the writer.
-		dst_handle->Close();
-		src_handle->Close();
+	if (fs.FileExists(actual_write_path)) {
+		fs.RemoveFile(actual_write_path);
 	}
-
-	// Phase 4: open the writer in append mode on dest_path. minizip reads the existing
-	// central directory and positions to write new entries after it.
-	writer = make_uniq<XLXSWriter>(context, dest_path, sheet_row_limit, ZipOpenMode::Append);
+	writer = make_uniq<XLXSWriter>(context, actual_write_path, sheet_row_limit);
 	writer->SetStyleIndices(styles.date, styles.ts_no_ms, styles.time_, styles.ts_with_ms, styles.boolean);
+
+	{
+		ZipFileReader source(context, source_path);
+
+		// Build a name -> last-occurrence-index map so that if the source has duplicate-name
+		// entries (e.g. files written by an older buggy version of the appender), we copy the
+		// authoritative (last) one and discard earlier shadows.
+		const auto names = source.ListEntries();
+		std::unordered_map<string, idx_t> last_index_for;
+		for (idx_t i = 0; i < names.size(); i++) {
+			last_index_for[names[i]] = i;
+		}
+
+		idx_t walk_idx = 0;
+		if (source.GotoFirstEntry()) {
+			do {
+				const auto &name = names[walk_idx];
+				const bool is_canonical = last_index_for[name] == walk_idx;
+				const bool is_skipped = rewrite_set.count(name) > 0;
+				const bool is_dir = !name.empty() && name.back() == '/';
+				if (is_canonical && !is_skipped && !is_dir) {
+					writer->GetStream().CopyCurrentEntryFrom(source);
+				}
+				walk_idx++;
+			} while (source.GotoNextEntry());
+		}
+	}
+	// source ZipFileReader released here; writer holds dest open until Finish().
 }
 
 inline void XLSXAppender::BeginSheet(const vector<string> &sql_column_names,
@@ -577,8 +620,27 @@ inline void XLSXAppender::Finish() {
 	writer->EndSheet();
 	EmitMetadata();
 	writer->GetStream().Finalize();
-	// dest_path is now a complete xlsx; the COPY framework will rename it onto the user's
-	// target path (when USE_TMP_FILE is true). For USE_TMP_FILE false, dest_path == target.
+	// `actual_write_path` is now a complete xlsx. If we wrote to a sibling tmp because
+	// source_path == dest_path, rename our tmp onto dest_path now. Otherwise the COPY
+	// framework will handle the rename (its own tmp -> user target).
+	if (needs_self_rename) {
+		auto &fs = FileSystem::GetFileSystem(context);
+		try {
+			if (fs.FileExists(dest_path)) {
+				fs.RemoveFile(dest_path);
+			}
+			fs.MoveFile(actual_write_path, dest_path);
+		} catch (...) {
+			// Best-effort cleanup of the orphan tmp; let the original error propagate.
+			try {
+				if (fs.FileExists(actual_write_path)) {
+					fs.RemoveFile(actual_write_path);
+				}
+			} catch (...) {
+			}
+			throw;
+		}
+	}
 }
 
 } // namespace duckdb

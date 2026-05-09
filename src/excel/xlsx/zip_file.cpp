@@ -178,7 +178,7 @@ void mz_stream_duckdb_delete(void **stream) {
 // Zip File Writer
 //-------------------------------------------------------------------------
 
-ZipFileWriter::ZipFileWriter(ClientContext &context, const string &file_name, ZipOpenMode mode) {
+ZipFileWriter::ZipFileWriter(ClientContext &context, const string &file_name) {
 	handle = mz_zip_writer_create();
 	stream = mz_stream_duckdb_create();
 	is_entry_open = false;
@@ -193,12 +193,7 @@ ZipFileWriter::ZipFileWriter(ClientContext &context, const string &file_name, Zi
 	mz_zip_writer_set_compress_level(handle, MZ_COMPRESS_LEVEL_NORMAL);
 	mz_zip_writer_set_compress_method(handle, MZ_COMPRESS_METHOD_DEFLATE);
 
-	const int32_t stream_flags = (mode == ZipOpenMode::Append)
-	                                 ? (MZ_OPEN_MODE_READ | MZ_OPEN_MODE_WRITE)
-	                                 : (MZ_OPEN_MODE_CREATE | MZ_OPEN_MODE_WRITE);
-	const uint8_t append_flag = (mode == ZipOpenMode::Append) ? 1 : 0;
-
-	if (mz_stream_open(stream, file_name.c_str(), stream_flags) != MZ_OK) {
+	if (mz_stream_open(stream, file_name.c_str(), MZ_OPEN_MODE_CREATE | MZ_OPEN_MODE_WRITE) != MZ_OK) {
 		if (duckdb_stream.last_error.empty()) {
 			throw IOException("Failed to open file for writing");
 		} else {
@@ -206,7 +201,7 @@ ZipFileWriter::ZipFileWriter(ClientContext &context, const string &file_name, Zi
 		}
 	}
 
-	if (mz_zip_writer_open(handle, stream, append_flag) != MZ_OK) {
+	if (mz_zip_writer_open(handle, stream, 0) != MZ_OK) {
 		if (duckdb_stream.last_error.empty()) {
 			throw IOException("Failed to open zip for writing");
 		} else {
@@ -290,75 +285,12 @@ void ZipFileWriter::Finalize() {
 	}
 }
 
-void ZipFileWriter::CopyEntryFrom(ZipFileReader &source, const string &entry_name) {
+void ZipFileWriter::CopyCurrentEntryFrom(ZipFileReader &source) {
 	if (is_entry_open) {
-		throw IOException("ZipWriter: Cannot copy an entry while another is open");
+		throw IOException("ZipWriter: Cannot copy an entry while another is open on the writer");
 	}
-
-	if (mz_zip_reader_locate_entry(source.handle, entry_name.c_str(), 0) != MZ_OK) {
-		throw IOException("ZipWriter: Source entry '%s' not found", entry_name);
-	}
-
-	mz_zip_file *src_info = nullptr;
-	if (mz_zip_reader_entry_get_info(source.handle, &src_info) != MZ_OK || src_info == nullptr) {
-		throw IOException("ZipWriter: Failed to read source entry info for '%s'", entry_name);
-	}
-
-	const bool is_directory = mz_zip_entry_is_dir(source.handle) == MZ_OK;
-
-	mz_zip_file file_info = {};
-	file_info.filename = entry_name.c_str();
-	file_info.compression_method = is_directory ? MZ_COMPRESS_METHOD_STORE : MZ_COMPRESS_METHOD_DEFLATE;
-	file_info.zip64 = MZ_ZIP64_DISABLE;
-	file_info.modified_date = src_info->modified_date;
-	file_info.creation_date = src_info->creation_date;
-	file_info.accessed_date = src_info->accessed_date;
-	file_info.external_fa = src_info->external_fa;
-	file_info.internal_fa = src_info->internal_fa;
-
-	if (is_directory) {
-		// Directory entries have no payload
-		if (mz_zip_writer_add_buffer(handle, nullptr, 0, &file_info) != MZ_OK) {
-			throw IOException("ZipWriter: Failed to write directory entry '%s'", entry_name);
-		}
-		return;
-	}
-
-	if (mz_zip_reader_entry_open(source.handle) != MZ_OK) {
-		throw IOException("ZipWriter: Failed to open source entry '%s' for reading", entry_name);
-	}
-
-	if (mz_zip_writer_entry_open(handle, &file_info) != MZ_OK) {
-		mz_zip_reader_entry_close(source.handle);
-		throw IOException("ZipWriter: Failed to open destination entry '%s' for writing", entry_name);
-	}
-
-	constexpr int32_t COPY_BUFFER_SIZE = 8192;
-	char buffer[COPY_BUFFER_SIZE];
-	while (true) {
-		const auto bytes_read = mz_zip_reader_entry_read(source.handle, buffer, COPY_BUFFER_SIZE);
-		if (bytes_read < 0) {
-			mz_zip_writer_entry_close(handle);
-			mz_zip_reader_entry_close(source.handle);
-			throw IOException("ZipWriter: Failed to read source entry '%s'", entry_name);
-		}
-		if (bytes_read == 0) {
-			break;
-		}
-		const auto bytes_written = mz_zip_writer_entry_write(handle, buffer, bytes_read);
-		if (bytes_written < 0) {
-			mz_zip_writer_entry_close(handle);
-			mz_zip_reader_entry_close(source.handle);
-			throw IOException("ZipWriter: Failed to write entry '%s'", entry_name);
-		}
-	}
-
-	if (mz_zip_writer_entry_close(handle) != MZ_OK) {
-		mz_zip_reader_entry_close(source.handle);
-		throw IOException("ZipWriter: Failed to close destination entry '%s'", entry_name);
-	}
-	if (mz_zip_reader_entry_close(source.handle) != MZ_OK) {
-		throw IOException("ZipWriter: Failed to close source entry '%s'", entry_name);
+	if (mz_zip_writer_copy_from_reader(handle, source.handle) != MZ_OK) {
+		throw IOException("ZipWriter: Failed to copy entry from source");
 	}
 }
 
@@ -512,6 +444,32 @@ bool ZipFileReader::EntryIsDirectory(const string &entry_name) {
 	if (mz_zip_reader_locate_entry(handle, entry_name.c_str(), 0) != MZ_OK) {
 		return false;
 	}
+	return mz_zip_entry_is_dir(handle) == MZ_OK;
+}
+
+bool ZipFileReader::GotoFirstEntry() {
+	if (is_entry_open) {
+		throw IOException("ZipReader: Cannot walk entries while another is open");
+	}
+	return mz_zip_reader_goto_first_entry(handle) == MZ_OK;
+}
+
+bool ZipFileReader::GotoNextEntry() {
+	if (is_entry_open) {
+		throw IOException("ZipReader: Cannot walk entries while another is open");
+	}
+	return mz_zip_reader_goto_next_entry(handle) == MZ_OK;
+}
+
+string ZipFileReader::CurrentEntryName() {
+	mz_zip_file *info = nullptr;
+	if (mz_zip_reader_entry_get_info(handle, &info) != MZ_OK || info == nullptr || info->filename == nullptr) {
+		return string();
+	}
+	return string(info->filename);
+}
+
+bool ZipFileReader::CurrentEntryIsDirectory() {
 	return mz_zip_entry_is_dir(handle) == MZ_OK;
 }
 
