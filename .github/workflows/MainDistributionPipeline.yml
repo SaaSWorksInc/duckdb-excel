@@ -31,6 +31,10 @@ jobs:
       duckdb_version: ${{ matrix.duckdb_version }}
       ci_tools_version: main
       extension_name: excel
+      # Default 'auto' trims the matrix on non-main branches — we publish from
+      # `xlsx-fast-append` (Pages source), so force the full platform set so
+      # every release lands the same arch coverage as a main-branch build.
+      reduced_ci_mode: 'disabled'
 
   deploy-pages:
     name: Publish to GitHub Pages
