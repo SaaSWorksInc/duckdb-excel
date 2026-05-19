@@ -32,9 +32,14 @@ jobs:
       ci_tools_version: main
       extension_name: excel
       # Default 'auto' trims the matrix on non-main branches — we publish from
-      # `xlsx-fast-append` (Pages source), so force the full platform set so
-      # every release lands the same arch coverage as a main-branch build.
+      # `main` (Pages source), so force the full platform set so every release
+      # lands the same arch coverage as a main-branch build.
       reduced_ci_mode: 'disabled'
+      # duckdb v1.4.4's vendored third_party/fmt uses stdext::checked_array_iterator,
+      # an MS extension removed in newer MSVC (VS 2022 17.10+). It no longer compiles
+      # on GitHub's Windows runner image, so skip the v1.4.4 Windows builds. v1.5.2's
+      # fmt is patched and builds fine, so it keeps the full matrix.
+      exclude_archs: ${{ matrix.duckdb_version == 'v1.4.4' && 'windows_amd64;windows_amd64_mingw' || '' }}
 
   deploy-pages:
     name: Publish to GitHub Pages
