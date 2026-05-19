@@ -35,6 +35,15 @@ jobs:
       # `xlsx-fast-append` (Pages source), so force the full platform set so
       # every release lands the same arch coverage as a main-branch build.
       reduced_ci_mode: 'disabled'
+      # Only linux_*/osx_* are consumed (the finqore-py pipeline runs DuckDB
+      # on Linux in prod and macOS arm in dev). The windows_* targets fail
+      # to compile DuckDB 1.4.4's vendored third_party/fmt under the MSVC
+      # 14.51 toolset GitHub now ships (`stdext::checked_array_iterator`
+      # was removed; fmt also needs /std:c++17) — an upstream DuckDB issue
+      # we can't patch from a pinned tag — and wasm_* is unused. Excluding
+      # them keeps the matrix green so the Pages deploy isn't blocked, and
+      # cuts ~30 min of CI per run.
+      exclude_archs: 'windows_amd64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
 
   deploy-pages:
     name: Publish to GitHub Pages
