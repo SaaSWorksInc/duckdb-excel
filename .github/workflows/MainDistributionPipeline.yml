@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        duckdb_version: [v1.4.4, v1.5.2]
+        duckdb_version: [v1.4.4, v1.5.3, v1.5.4]
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
       duckdb_version: ${{ matrix.duckdb_version }}
@@ -36,9 +36,10 @@ jobs:
       # lands the same arch coverage as a main-branch build.
       reduced_ci_mode: 'disabled'
       # duckdb v1.4.4's vendored third_party/fmt uses stdext::checked_array_iterator,
-      # an MS extension removed in newer MSVC (VS 2022 17.10+). It no longer compiles
-      # on GitHub's Windows runner image, so skip the v1.4.4 Windows builds. v1.5.2's
-      # fmt is patched and builds fine, so it keeps the full matrix.
+      # an MS extension removed in newer MSVC (VS 2022 17.10+) that no longer compiles
+      # on GitHub's Windows runner image — so skip the v1.4.4 Windows builds. Newer
+      # releases keep the full matrix; if a Windows build breaks there too, the
+      # always() deploy below still publishes the required (non-Windows) archs.
       exclude_archs: ${{ matrix.duckdb_version == 'v1.4.4' && 'windows_amd64;windows_amd64_mingw' || '' }}
 
   deploy-pages:
@@ -112,7 +113,7 @@ jobs:
         # so the previous good deploy stays in place.
         run: |
           set -euo pipefail
-          required_versions="v1.4.4 v1.5.2"
+          required_versions="v1.4.4 v1.5.3 v1.5.4"
           required_archs="linux_amd64 linux_arm64 osx_amd64 osx_arm64"
           missing=0
           for version in $required_versions; do
