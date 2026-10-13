@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        duckdb_version: [v1.4.4, v1.5.2, v1.5.3, v1.5.4]
+        duckdb_version: [v1.4.4, v1.5.2, v1.5.3, v1.5.4, v1.5.6]
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
       duckdb_version: ${{ matrix.duckdb_version }}
@@ -45,8 +45,8 @@ jobs:
   deploy-pages:
     name: Publish to GitHub Pages
     needs: duckdb-stable-build
-    # Deploy on every push (any branch) and on manual dispatch. Skip PR builds since
-    # they can't access secrets/permissions and would conflict with the head-branch run.
+    # Only reviewed main builds publish; feature branches validate new binaries
+    # without replacing the extension repository used by production pipelines.
     #
     # `always()` so a non-essential platform failure in the build matrix
     # (e.g. windows_amd64) doesn't skip the deploy — consumers only install
@@ -55,7 +55,7 @@ jobs:
     # binaries present" step below still fails the deploy if any platform
     # we actually serve is missing, so a fully-broken build can never wipe
     # the live site.
-    if: ${{ always() && github.event_name != 'pull_request' }}
+    if: ${{ always() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -113,7 +113,7 @@ jobs:
         # so the previous good deploy stays in place.
         run: |
           set -euo pipefail
-          required_versions="v1.4.4 v1.5.3 v1.5.4"
+          required_versions="v1.4.4 v1.5.3 v1.5.4 v1.5.6"
           required_archs="linux_amd64 linux_arm64 osx_amd64 osx_arm64"
           missing=0
           for version in $required_versions; do
