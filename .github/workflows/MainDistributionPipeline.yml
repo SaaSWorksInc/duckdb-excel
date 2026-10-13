@@ -45,8 +45,8 @@ jobs:
   deploy-pages:
     name: Publish to GitHub Pages
     needs: duckdb-stable-build
-    # Only reviewed main builds publish; feature branches validate new binaries
-    # without replacing the extension repository used by production pipelines.
+    # Deploy on every push (any branch) and on manual dispatch. Skip PR builds since
+    # they can't access secrets/permissions and would conflict with the head-branch run.
     #
     # `always()` so a non-essential platform failure in the build matrix
     # (e.g. windows_amd64) doesn't skip the deploy — consumers only install
@@ -55,7 +55,7 @@ jobs:
     # binaries present" step below still fails the deploy if any platform
     # we actually serve is missing, so a fully-broken build can never wipe
     # the live site.
-    if: ${{ always() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+    if: ${{ always() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
